@@ -93,7 +93,7 @@ use_https = True
 verbosity = WARNING
 signature_v2 = True
 ```
-# 主配置
+# openrestry主配置
 
 ```lua
 upstream riakcs_hosts {
@@ -102,6 +102,7 @@ upstream riakcs_hosts {
 ...
 location @csproxy {
         -- 注意这里需要使用bucket名字作为域名的前缀
+        -- <BUCKET>.user.com
         proxy_set_header  Host test-abc.user.com;
         proxy_set_header  X-Real-IP $remote_addr;
         proxy_set_header  X-Forwarded-Proto http;
@@ -109,7 +110,9 @@ location @csproxy {
         proxy_pass    http://riakcs_hosts;
     }
     ...
- location /user/file {
+-- /<BUCKET>/<KEY>
+-- /test-abc/user.jpg
+ location /test-abc {
         if ($request_method = OPTIONS) {
             add_header Access-Control-Allow-Origin *;
             add_header Access-Control-Allow-Credentials true;
@@ -120,21 +123,29 @@ location @csproxy {
         client_max_body_size 60M;
         access_by_lua_file cs_auth.lua;
         -- 注意这里要rewrite test-abc桶
-        rewrite /user/file/(.*) /test-abc/$1?$args break;
+        -- rewrite /test-abc/(.*) /test-abc/$1 break;
         try_files $uri $uri/ @csproxy;
     }
  ```
 # accept_lua_file脚本
 
 ```lua
--- description:
+--- description:
 -- 1 check jwt_token
 -- 2 generate cs signature
 
 local m = ngx.req.get_method()
+-- POST和PUT统一修改为PUT方法
+if ngx.req.get_method() == "POST" then
+    m = "PUT"
+    ngx.req.set_method(ngx.HTTP_PUT)
+end
 local h = ngx.req.get_headers()
 local md5 = h["content-md5"]
 local content_type = h["content-type"]
+if content_type == nil then 
+    content_type = ""
+end
 local timestamp = h["timestamp"]
 local file_type = h["file-type"]
 local request_uri = ngx.var.request_uri
@@ -142,52 +153,55 @@ local request_host = ngx.var.host
 -- Fix me: check jwt_token.
 local m = ngx.req.get_method()
 local h = ngx.req.get_headers()
+-- token放到Authorization或者路径参数
 local auth = h["Authorization"]
-ngx.log(ngx.WARN, "no authorization")
-if (nil == auth) or ("" == auth)
-then
-	ngx.log(ngx.WARN, "no authorization")
+if (auth == nil or auth == "") then
+   local args, err = ngx.req.get_uri_args()
+   auth = ""
+   auth = args["token"]
+end
+if (nil == auth) or ("" == auth) then
+	ngx.log(ngx.ERR, "no authorization")
 	--ngx.exit(ngx.HTTP_UNAUTHORIZED)
 	ngx.exit(ngx.HTTP_FORBIDDEN)
 end
 
 
---ngx.log(ngx.ERR, "Authorization: " .. auth)
-
 local cjson = require "cjson"
 local jwt = require "resty.jwt"
 
-local secret = "<YOUR JWT secret>"
+local secret = "<YOUR JWT SECRET>"
 
 local jwt_obj = jwt:verify(secret, auth)
 
 if jwt_obj.verified == false then
-	--ngx.log(ngx.ERR, "Invalid token: ".. jwt_obj.reason)
+--	ngx.log(ngx.ERR, "Invalid token: ".. jwt_obj.reason..",auth:"..auth)
 	ngx.exit(ngx.HTTP_FORBIDDEN)
 end
 -- generate cs signature.
+
 local now_seconds = ngx:time()
 local date = ngx.http_time(now_seconds)
-local put_obj_name = string.gsub(request_uri,"/","")
-local bucket = "test-abc"
 if (nil == md5)
 then
 	ngx.log(ngx.NOTICE, "md5 is empty end")
 	md5 = ""
 end
-local segments = {}
-        for segment in string.gmatch(request_uri, "[^/]+") do
-            table.insert(segments, segment)
-        end
-        -- Get the last path segment
-local last_segment = tostring(segments[#segments])
-local stringtosign = m.."\n"..md5.."\n"..content_type.."\n"..date.."\n/"..bucket.."/"..last_segment
-
-
-
- local key="<YOUR KEY>"
- local access_key = "<YOUR SECRET>"
+-- 去掉路径参数
+local uri_without_params = string.match(request_uri, "^[^?]*")
+local stringtosign = m.."\n"..md5.."\n"..content_type.."\n"..date.."\n"..uri_without_params
+local key="<YOUR riakcs KEY>"
+local access_key = "<YOUR riakcs SECRET KEY>"
 local digest = ngx.hmac_sha1(access_key, stringtosign)
 local encode = ngx.encode_base64(digest)
 local auth = "AWS "..key..":"..encode
+
+ngx.log(ngx.ERR, stringtosign)
+ngx.log(ngx.ERR, request_uri)
+ngx.req.set_header("date", date)
+if content_type ~= "" then
+    ngx.req.set_header("content-type", content_type)
+end
+ngx.req.set_header("Authorization", auth)
+
 ```
